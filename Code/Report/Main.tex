@@ -1,0 +1,283 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+% Code listing style
+\lstset{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10},
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+% Title
+\title{\textbf{BackProp GCN} \\
+\large End-to-End Training Through Differentiable Ranking}
+\author{Ian Bezerra}
+\date{2025}
+
+\begin{document}
+
+\maketitle
+
+\section{The Problem}
+
+Normal GCN training uses frozen features! Normally from a vision model like ViT or Dino...
+
+Here I will put some code snippets of the idea of making the whole process fit into one backward call and be able to run an optimizer like AdamW through the whole GCN into the Extractor!
+
+\subsection{How We Normally Do Things}
+
+\begin{lstlisting}
+# Extract features...
+features = dinov2(images)  # No gradients!
+features = features.detach()
+
+# Compute rankings...
+rankings = compute_rankings(features)
+
+# Train GCN on FIXED graph!!
+for epoch in range(100):
+    loss = gcn(features, rankings)
+    loss.backward()  # Only updates GCN, NOT DINOv2!
+\end{lstlisting}
+
+The key point here is that the Extractor doesn't learn anything. The features might not be optimal for the GCN task!
+
+\section{The Idea: Differentiable Ranking}
+
+\subsection{Step 1: Compute Similarity (Differentiable)}
+
+\begin{lstlisting}
+# Normalize features
+features_norm = F.normalize(features, p=2, dim=1)
+
+# Cosine similarity matrix
+similarity = features_norm @ features_norm.T
+\end{lstlisting}
+
+\subsection{Step 2: Apply Soft Top-K (Differentiable)}
+
+\begin{lstlisting}
+# Apply temperature and softmax
+soft_weights = F.softmax(similarity / temperature, dim=1)
+
+# Get top-k indices
+_, rankings = torch.topk(similarity, k=10)
+
+# Extract soft weights for top-k neighbors
+top_k_weights = soft_weights.gather(1, rankings)
+\end{lstlisting}
+
+We use \texttt{softmax} instead of hard \texttt{topk}.
+
+\subsection{Step 3: Build Graph}
+
+\begin{lstlisting}
+# Create edges from rankings
+for i in range(N):
+    for j in range(k):
+        neighbor = rankings[i, j]
+        edges.append([i, neighbor])
+\end{lstlisting}
+
+The edge structure depends on rankings, which depend on features!
+
+\subsection{Step 4: GCN Forward}
+
+\begin{lstlisting}
+# Features flow through GCN
+x = features  # [N, D] - has gradients!
+x = gcn_layer1(x, edges)
+x = relu(x)
+x = gcn_layer2(x, edges)
+output = log_softmax(x)
+\end{lstlisting}
+
+Everything is differentiable.
+
+\subsection{Step 5: Backward Pass}
+
+\begin{lstlisting}
+loss = nll_loss(output[train_mask], labels[train_mask])
+loss.backward()
+
+# Gradients flow backward through:
+# loss -> output -> gcn_layer2 -> gcn_layer1 -> features
+#      -> soft_weights -> similarity -> features_norm
+#      -> features -> dinov2!
+\end{lstlisting}
+
+\section{End-to-End Training Loop}
+
+\begin{lstlisting}
+# Optimizer includes BOTH GCN and DINOv2
+optimizer = Adam(gcn.parameters() + dinov2.parameters())
+
+for epoch in range(200):
+    # 1. Extract features (with gradients!)
+    features = dinov2(images)  # Gradients enabled!
+
+    # 2. Compute differentiable rankings
+    similarity = features_norm @ features_norm.T
+    soft_weights = softmax(similarity / temperature)
+    rankings, top_k_weights = topk(similarity, soft_weights, k=10)
+
+    # 3. Build graph from rankings
+    edges = build_edges(rankings)
+
+    # 4. Forward through GCN
+    output = gcn(features, edges)
+
+    # 5. Compute loss
+    loss = nll_loss(output[train_mask], labels)
+
+    # 6. Backward (updates BOTH GCN and DINOv2!)
+    loss.backward()
+
+    # 7. Update parameters
+    optimizer.step()  # Updates both GCN AND DINOv2!
+\end{lstlisting}
+
+\section{Math: Differentiable Top-K Selection}
+
+\subsection{The Problem with Hard Top-K}
+
+Traditional ranking uses discrete operations:
+
+\begin{lstlisting}[language=Python]
+indices = argsort(scores)[:k]
+\end{lstlisting}
+
+This has \textbf{zero gradient everywhere}:
+
+\begin{equation}
+\frac{\partial \text{topk}(x)}{\partial x} = 0
+\end{equation}
+
+No gradients means no backpropagation!
+
+\subsection{Our Solution: Soft Top-K with Softmax}
+
+Instead, we use a \textbf{soft approximation} via temperature-scaled softmax:
+
+\subsubsection{Step 1: Compute Similarity Matrix}
+
+For features $F \in \mathbb{R}^{N \times D}$:
+
+\begin{equation}
+S_{ij} = \frac{F_i \cdot F_j}{\|F_i\| \|F_j\|}
+\end{equation}
+
+This is the \textbf{cosine similarity} between feature vectors.
+
+\subsubsection{Step 2: Apply Temperature-Scaled Softmax}
+
+For each node $i$, compute soft weights over all nodes:
+
+\begin{equation}
+w_{ij} = \frac{\exp(S_{ij} / \tau)}{\sum_{l=1}^{N} \exp(S_{il} / \tau)}
+\end{equation}
+
+Where:
+\begin{itemize}
+    \item $\tau$ is the \textbf{temperature} parameter
+    \item Lower $\tau$ $\rightarrow$ sharper distribution (closer to hard selection)
+    \item Higher $\tau$ $\rightarrow$ smoother distribution
+\end{itemize}
+
+\subsubsection{Step 3: Select Top-K Neighbors}
+
+Get indices of top-k similarities:
+
+\begin{equation}
+\mathcal{N}_k(i) = \text{topk}(S_i, k)
+\end{equation}
+
+Extract corresponding soft weights:
+
+\begin{equation}
+\tilde{w}_{ij} = w_{ij}, \quad \forall j \in \mathcal{N}_k(i)
+\end{equation}
+
+These weights $\tilde{w}_{ij}$ are \textbf{differentiable}!
+
+\subsection{Why This Works: The Gradient}
+
+The softmax function has well-defined gradients:
+
+\begin{equation}
+\frac{\partial w_{ij}}{\partial S_{il}} = \frac{1}{\tau} w_{ij} (\delta_{jl} - w_{il})
+\end{equation}
+
+Where $\delta_{jl}$ is the Kronecker delta.
+
+This means:
+\begin{itemize}
+    \item \textbf{Non-zero gradients} flow backward through the softmax
+    \item Gradients propagate from $w_{ij} \rightarrow S_{ij} \rightarrow F_i \rightarrow$ DINOv2
+    \item The entire pipeline remains differentiable!
+\end{itemize}
+
+\subsection{Temperature Parameter Effect}
+
+The temperature $\tau$ controls the approximation quality:
+
+\begin{equation}
+\lim_{\tau \to 0} w_{ij} = \begin{cases}
+1 & \text{if } j = \arg\max_l S_{il} \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\textbf{In practice:}
+\begin{itemize}
+    \item $\tau = 0.1$: Sharp, almost discrete (gradients can vanish)
+    \item $\tau = 1.0$: Balanced (recommended)
+    \item $\tau = 10.0$: Very smooth (weak selection)
+\end{itemize}
+
+\subsection{Complete Forward Pass Formula}
+
+For node $i$ with features $f_i$:
+
+\begin{align}
+S_i &= f_i \cdot F^T / (\|f_i\| \|F\|) \quad &&\text{(similarity)} \\
+w_i &= \text{softmax}(S_i / \tau) \quad &&\text{(soft weights)} \\
+\mathcal{N}_k(i) &= \text{topk}(S_i, k) \quad &&\text{(neighbor indices)} \\
+\tilde{w}_i &= w_i[\mathcal{N}_k(i)] \quad &&\text{(top-k weights)}
+\end{align}
+
+All operations are differentiable with respect to $f_i$!
+
+\subsection{Backward Pass (Chain Rule)}
+
+Given loss $\mathcal{L}$, gradients flow:
+
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial f_i} =
+\sum_{j \in \mathcal{N}_k(i)} \frac{\partial \mathcal{L}}{\partial \tilde{w}_{ij}}
+\frac{\partial \tilde{w}_{ij}}{\partial w_{ij}}
+\frac{\partial w_{ij}}{\partial S_{ij}}
+\frac{\partial S_{ij}}{\partial f_i}
+\end{equation}
+
+Every term is \textbf{non-zero and computable!}
+
+\end{document}
